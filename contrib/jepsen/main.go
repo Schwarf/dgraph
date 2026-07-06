@@ -35,6 +35,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 
+	"github.com/dgraph-io/dgraph/v25/buildvars"
 	"github.com/dgraph-io/dgraph/v25/contrib/jepsen/browser"
 )
 
@@ -108,7 +109,7 @@ var (
 		"Interval of Dgraph's tablet rebalancing.")
 	nemesisInterval = pflag.String("nemesis-interval", "10",
 		"Roughly how long to wait (in seconds) between nemesis operations.")
-	localBinary = pflag.StringP("local-binary", "b", "/gobin/dgraph",
+	localBinary = pflag.StringP("local-binary", "b", buildvars.GoBinDgraphPath.Get(),
 		"Path to Dgraph binary within the Jepsen control node.")
 	nodes     = pflag.String("nodes", "n1,n2,n3,n4,n5", "Nodes to run on.")
 	replicas  = pflag.Int("replicas", 3, "How many replicas of data should dgraph store?")
@@ -116,7 +117,7 @@ var (
 	testCount = pflag.IntP("test-count", "c", 1, "Test count per Jepsen test.")
 	jaeger    = pflag.StringP("jaeger", "j", "",
 		"Run with Jaeger collector. Set to empty string to disable collection to Jaeger."+
-			" Otherwise set to http://jaeger:14268.")
+			" Otherwise set to http://jaeger:4318.")
 	jaegerSaveTraces = pflag.Bool("jaeger-save-traces", true, "Save Jaeger traces on test error.")
 	deferDbTeardown  = pflag.Bool("defer-db-teardown", false,
 		"Wait until user input to tear down DB nodes")

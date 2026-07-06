@@ -6,9 +6,11 @@
 package dgraphtest
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
@@ -115,10 +118,22 @@ func (c *LocalCluster) init() error {
 	if err != nil {
 		return errors.Wrap(err, "error while creating tempBinDir")
 	}
+	// WidenTempDirPerms is a public hook in dgraphtest/hooks.go; the
+	// default is no-op. Downstream consumers running dgraph as a
+	// non-root user inside compose-test containers override it to
+	// widen perms on host-side temp dirs bind-mounted into containers,
+	// so the in-container uid can read and write those paths.
+	if err := WidenTempDirPerms(c.tempBinDir); err != nil {
+		return err
+	}
 	log.Printf("[INFO] tempBinDir: %v", c.tempBinDir)
 	c.tempSecretsDir, err = os.MkdirTemp("", c.conf.prefix)
 	if err != nil {
 		return errors.Wrap(err, "error while creating tempSecretsDir")
+	}
+	// Same hook, applied to the secrets temp dir.
+	if err := WidenTempDirPerms(c.tempSecretsDir); err != nil {
+		return err
 	}
 	log.Printf("[INFO] tempSecretsDir: %v", c.tempSecretsDir)
 
@@ -303,6 +318,13 @@ func (c *LocalCluster) createContainer(dc dnode) (string, error) {
 	}
 
 	cconf := &container.Config{Cmd: cmd, Image: image, WorkingDir: dc.workingDir(), ExposedPorts: dc.ports()}
+	// ApplyContainerUser is a public hook in dgraphtest/hooks.go; the
+	// default is no-op. Downstream consumers that run dgraph as a
+	// non-root user inside the test container override it to set
+	// cconf.User to the host's uid:gid, so files the container writes
+	// are readable on the host and bind-mounted host paths are readable
+	// inside the container.
+	ApplyContainerUser(cconf)
 	hconf := &container.HostConfig{Mounts: mts, PublishAllPorts: true, PortBindings: dc.bindings(c.conf.portOffset)}
 	networkConfig := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
@@ -333,7 +355,7 @@ func (c *LocalCluster) destroyContainers() error {
 		wg.Add(1)
 		go func(z *zero) {
 			defer wg.Done()
-			if err := c.dcli.ContainerRemove(ctx, z.cid(), ro); err != nil {
+			if err := c.dcli.ContainerRemove(ctx, z.cid(), ro); err != nil && !cerrdefs.IsNotFound(err) {
 				errChan <- errors.Wrapf(err, "error removing zero [%v]", z.cname())
 			}
 		}(zo)
@@ -343,7 +365,7 @@ func (c *LocalCluster) destroyContainers() error {
 		wg.Add(1)
 		go func(a *alpha) {
 			defer wg.Done()
-			if err := c.dcli.ContainerRemove(ctx, a.cid(), ro); err != nil {
+			if err := c.dcli.ContainerRemove(ctx, a.cid(), ro); err != nil && !cerrdefs.IsNotFound(err) {
 				errChan <- errors.Wrapf(err, "error removing alpha [%v]", a.cname())
 			}
 		}(aa)
@@ -594,6 +616,75 @@ func (c *LocalCluster) StopZero(id int) error {
 	return c.stopContainer(c.zeros[id])
 }
 
+// GetZeroContainerName returns the Docker container name for the specified Zero,
+// which also serves as a DNS alias on the cluster network.
+func (c *LocalCluster) GetZeroContainerName(id int) (string, error) {
+	if id >= c.conf.numZeros {
+		return "", fmt.Errorf("invalid id of zero: %v", id)
+	}
+	return c.zeros[id].containerName, nil
+}
+
+// SetZeroMyAddr overrides the --my flag for the specified Zero node. The next
+// time the container is recreated (via RecreateZero), this address will be
+// used instead of the default container alias.
+func (c *LocalCluster) SetZeroMyAddr(id int, addr string) error {
+	if id >= c.conf.numZeros {
+		return fmt.Errorf("invalid id of zero: %v", id)
+	}
+	c.zeros[id].myAddrOverride = addr
+	return nil
+}
+
+// RecreateZero destroys the Zero container and creates a new one with the
+// current command-line flags (e.g. a different --my address). The Zero's data
+// directory is preserved across the recreation by extracting it from the old
+// (stopped) container and injecting it into the new one. This simulates a
+// process restart with persistent storage — the exact scenario where stale WAL
+// addresses surface.
+func (c *LocalCluster) RecreateZero(id int) error {
+	if id >= c.conf.numZeros {
+		return fmt.Errorf("invalid id of zero: %v", id)
+	}
+	z := c.zeros[id]
+
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	// Extract the data directory from the stopped container so the WAL survives.
+	dataReader, _, err := c.dcli.CopyFromContainer(ctx, z.cid(), zeroWorkingDir)
+	if err != nil {
+		return errors.Wrapf(err, "error copying data from zero container [%v]", z.cname())
+	}
+	defer dataReader.Close()
+
+	// Read the tar into memory (Zero WAL is small).
+	dataTar, err := io.ReadAll(dataReader)
+	if err != nil {
+		return errors.Wrap(err, "error reading zero data tar")
+	}
+
+	ro := container.RemoveOptions{RemoveVolumes: true, Force: true}
+	if err := c.dcli.ContainerRemove(ctx, z.cid(), ro); err != nil && !cerrdefs.IsNotFound(err) {
+		return errors.Wrapf(err, "error removing zero container [%v]", z.cname())
+	}
+
+	cid, err := c.createContainer(z)
+	if err != nil {
+		return errors.Wrapf(err, "error recreating zero container [%v]", z.cname())
+	}
+	z.containerID = cid
+
+	// Inject the data directory into the new container. CopyToContainer expects
+	// a tar archive rooted at the parent of the target path.
+	if err := c.dcli.CopyToContainer(ctx, cid, "/data", bytes.NewReader(dataTar),
+		container.CopyToContainerOptions{}); err != nil {
+		return errors.Wrapf(err, "error restoring data to zero container [%v]", z.cname())
+	}
+
+	return nil
+}
+
 func (c *LocalCluster) StopAlpha(id int) error {
 	if id >= c.conf.numAlphas {
 		return fmt.Errorf("invalid id of alpha: %v", id)
@@ -777,18 +868,21 @@ func (c *LocalCluster) waitUntilGraphqlHealthCheck() error {
 		return errors.Wrap(err, "error creating http client while graphql health check")
 	}
 	if c.conf.acl {
-		for range 5 {
+		for attempt := range 10 {
 			if err = hc.LoginIntoNamespace(dgraphapi.DefaultUser, dgraphapi.DefaultPassword, x.RootNamespace); err == nil {
 				break
 			}
-			time.Sleep(1 * time.Second)
+			if attempt > 5 {
+				log.Printf("[WARNING] problem trying to login during graphql health check: %v", err)
+			}
+			time.Sleep(waitDurBeforeRetry)
 		}
 		if err != nil {
 			return errors.Wrap(err, "error during login while graphql health check")
 		}
 	}
 
-	for range 10 {
+	for attempt := range 10 {
 		// Sleep for a second before retrying
 		time.Sleep(waitDurBeforeRetry)
 		// we do this because before v21, we used to propose the initial schema to the cluster.
@@ -798,6 +892,9 @@ func (c *LocalCluster) waitUntilGraphqlHealthCheck() error {
 		if err == nil {
 			log.Printf("[INFO] graphql health check succeeded for %v", c.conf.prefix)
 			return nil
+		}
+		if attempt > 5 {
+			log.Printf("[WARNING] problem during graphql health check: %v", err)
 		}
 	}
 	return errors.Wrap(err, "error during graphql health check")
@@ -992,7 +1089,12 @@ func (c *LocalCluster) HTTPClient() (*dgraphapi.HTTPClient, error) {
 		return nil, err
 	}
 
-	return dgraphapi.GetHttpClient(alphaUrl, zeroUrl)
+	hc, err := dgraphapi.GetHttpClient(alphaUrl, zeroUrl)
+	if err != nil {
+		return nil, err
+	}
+	hc.AuthToken = c.conf.securityToken
+	return hc, nil
 }
 
 func (c *LocalCluster) GetAlphaHttpClient(alphaID int) (*dgraphapi.HTTPClient, error) {
@@ -1233,6 +1335,13 @@ func (c *LocalCluster) inspectContainer(containerID string) (string, error) {
 }
 
 func (c *LocalCluster) setupSecrets() error {
+	// WidenSecretFilePerms is a public hook in dgraphtest/hooks.go; the
+	// default is no-op. Secret files use mode 0600 (owner-only), which
+	// is correct upstream. Downstream consumers running the dgraph
+	// container as a non-root user that differs from the host owner
+	// override the hook to widen perms — for example, adding group- or
+	// world-read — so the in-container uid can read the bind-mounted
+	// secret files.
 	if c.conf.encryption {
 		// use this key because some of the data is already encrypted using this key.
 		encKey := []byte("1234567890123456")
@@ -1240,11 +1349,17 @@ func (c *LocalCluster) setupSecrets() error {
 		if err := os.WriteFile(c.encKeyPath, encKey, 0600); err != nil {
 			return err
 		}
+		if err := WidenSecretFilePerms(c.encKeyPath); err != nil {
+			return err
+		}
 	}
 
 	if c.conf.acl {
 		aclSecretPath := filepath.Join(c.tempSecretsDir, aclKeyFile)
 		if err := generateACLSecret(c.conf.aclAlg, aclSecretPath); err != nil {
+			return err
+		}
+		if err := WidenSecretFilePerms(aclSecretPath); err != nil {
 			return err
 		}
 	}
@@ -1303,6 +1418,20 @@ func runOpennssl(args ...string) error {
 }
 
 func (c *LocalCluster) GeneratePlugins(raceEnabled bool) error {
+	// GeneratePlugins is a public hook in dgraphtest/hooks.go. The
+	// upstream default returns (nil, false, nil), so the host-side
+	// `go build -buildmode=plugin` fallback below runs. Downstream
+	// consumers whose toolchain is not directly invokable on the host
+	// — for example, forks pinning a Docker-only build image —
+	// override the hook to compile plugins inside that image and
+	// return their .so paths. When handled=true the override's outcome
+	// wins and the host-side fallback is skipped.
+	if tokenizers, handled, err := GeneratePlugins(raceEnabled, c.tempBinDir, baseRepoDir); handled {
+		if err == nil {
+			c.customTokenizers = tokenizers
+		}
+		return err
+	}
 	_, curr, _, ok := runtime.Caller(0)
 	if !ok {
 		return errors.New("error while getting current file")
@@ -1320,11 +1449,19 @@ func (c *LocalCluster) GeneratePlugins(raceEnabled bool) error {
 		if raceEnabled {
 			opts = append(opts, "-race")
 		}
-		opts = append(opts, "-buildmode=plugin", "-o", so, src)
-		os.Setenv("GOOS", "linux")
-		os.Setenv("GOARCH", "amd64")
+		opts = append(opts, "-buildmode=plugin")
+		if runtime.GOOS != "linux" {
+			// Use the BFD linker; the default gold linker is not shipped
+			// with most cross-compiler toolchains.
+			opts = append(opts, "-ldflags", "-extldflags -fuse-ld=bfd")
+		}
+		opts = append(opts, "-o", so, src)
 		cmd := exec.Command("go", opts...)
 		cmd.Dir = filepath.Dir(curr)
+		cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH)
+		if runtime.GOOS != "linux" {
+			cmd.Env = append(cmd.Env, "CGO_ENABLED=1", "CC="+linuxCrossCC())
+		}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			log.Printf("Error: %v\n", err)
 			log.Printf("Output: %v\n", string(out))
@@ -1343,6 +1480,22 @@ func (c *LocalCluster) GeneratePlugins(raceEnabled bool) error {
 	log.Printf("plugin build completed. Files are: %s\n", sofiles)
 
 	return nil
+}
+
+// linuxCrossCC returns the C cross-compiler for targeting Linux from the current host.
+// Respects the LINUX_CC environment variable if set.
+func linuxCrossCC() string {
+	if cc := os.Getenv("LINUX_CC"); cc != "" {
+		return cc
+	}
+	switch runtime.GOARCH {
+	case "arm64":
+		return "aarch64-unknown-linux-gnu-gcc"
+	case "amd64":
+		return "x86_64-unknown-linux-gnu-gcc"
+	default:
+		return "gcc"
+	}
 }
 
 func (c *LocalCluster) GetAlphaGrpcPublicPort(id int) (string, error) {
@@ -1367,4 +1520,91 @@ func (c *LocalCluster) GetAlphaGrpcEndpoint(id int) (string, error) {
 		return "", err
 	}
 	return "0.0.0.0:" + pubPort, nil
+}
+
+// CopyExportToHost copies exported files from the container to a host directory.
+// It returns the paths to RDF/JSON files and schema files on the host.
+func (c *LocalCluster) ReadFileFromContainer(containerPath string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	ts, _, err := c.dcli.CopyFromContainer(ctx, c.alphas[0].cid(), containerPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error copying file from container [%v]", c.alphas[0].cname())
+	}
+	defer ts.Close()
+
+	tr := tar.NewReader(ts)
+	if _, err := tr.Next(); err != nil {
+		return nil, errors.Wrap(err, "error reading tar header")
+	}
+	data, err := io.ReadAll(tr)
+	if err != nil {
+		return nil, errors.Wrap(err, "error reading file contents from tar stream")
+	}
+	return data, nil
+}
+
+func (c *LocalCluster) CopyExportToHost(exportDir, hostDir string) (dataFiles, schemaFiles []string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	// Copy the exported data from the container to host
+	ts, _, err := c.dcli.CopyFromContainer(ctx, c.alphas[0].cid(), exportDir)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "error copying export dir from container [%v]", c.alphas[0].cname())
+	}
+	defer func() {
+		if err := ts.Close(); err != nil {
+			log.Printf("[WARNING] error closing tared stream from docker cp for [%v]", c.alphas[0].cname())
+		}
+	}()
+
+	// Extract files from tar stream
+	tr := tar.NewReader(ts)
+	for {
+		header, err := tr.Next()
+		if stderrors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return nil, nil, errors.Wrapf(err, "error reading file in tared stream: [%+v]", header)
+		}
+		if header.Typeflag != tar.TypeReg {
+			continue
+		}
+
+		fileName := filepath.Base(header.Name)
+		hostFile := filepath.Join(hostDir, fileName)
+
+		if !strings.HasPrefix(filepath.Clean(hostFile), filepath.Clean(hostDir)+string(os.PathSeparator)) {
+			return nil, nil, errors.Errorf("illegal file path in archive: %v", header.Name)
+		}
+
+		switch {
+		case strings.HasSuffix(fileName, ".rdf.gz"):
+			dataFiles = append(dataFiles, hostFile)
+		case strings.HasSuffix(fileName, ".json.gz"):
+			dataFiles = append(dataFiles, hostFile)
+		case strings.HasSuffix(fileName, ".schema.gz"):
+			schemaFiles = append(schemaFiles, hostFile)
+		case strings.HasSuffix(fileName, ".gql_schema.gz"):
+			// Skip gql schema files for now
+			continue
+		default:
+			log.Printf("[WARNING] unexpected file in export: %v", fileName)
+			continue
+		}
+
+		fd, err := os.Create(hostFile)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "error creating file [%v]", hostFile)
+		}
+		defer fd.Close()
+
+		if _, err := io.Copy(fd, tr); err != nil {
+			return nil, nil, errors.Wrapf(err, "error writing to [%v] from: [%+v]", fd.Name(), header)
+		}
+	}
+
+	return dataFiles, schemaFiles, nil
 }

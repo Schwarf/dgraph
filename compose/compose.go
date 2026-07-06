@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/pflag"
 	yaml "gopkg.in/yaml.v3"
 
+	"github.com/dgraph-io/dgraph/v25/buildvars"
 	"github.com/dgraph-io/dgraph/v25/x"
 )
 
@@ -79,7 +80,9 @@ type options struct {
 	DataVol        bool
 	TmpFS          bool
 	UserOwnership  bool
-	Jaeger         bool
+	Jaeger         int
+	TraceRatio     string
+	TraceService   bool
 	Metrics        bool
 	PortOffset     int
 	Verbosity      int
@@ -152,6 +155,16 @@ func initService(basename string, idx, grpcPort int) service {
 	svc.Image = opts.Image + ":" + opts.Tag
 	svc.ContainerName = containerName(svc.name)
 	svc.WorkingDir = fmt.Sprintf("/data/%s", svc.name)
+	// EmitUser is a public hook in compose/hooks.go. The upstream
+	// default returns "" so the generated compose service inherits the
+	// image's own USER directive. Downstream consumers that run dgraph
+	// as a non-root user under compose override the hook to return a
+	// "uid:gid" string such as "${UID:-65532}", which is emitted as the
+	// service's `user:` field. Bind-mounted host paths must be readable
+	// by that uid for the container to start cleanly.
+	if u := EmitUser(); u != "" {
+		svc.User = u
+	}
 	if idx > 1 {
 		svc.DependsOn = append(svc.DependsOn, name(basename, idx-1))
 	}
@@ -188,9 +201,9 @@ func initService(basename string, idx, grpcPort int) service {
 		// no data volume
 	}
 
-	svc.Command = "dgraph"
+	svc.Command = buildvars.BinaryName.Get()
 	if opts.LocalBin {
-		svc.Command = "/gobin/dgraph"
+		svc.Command = buildvars.GoBinDgraphPath.Get()
 	}
 	if opts.UserOwnership {
 		user, err := user.Current()
@@ -202,8 +215,15 @@ func initService(basename string, idx, grpcPort int) service {
 		svc.Command += fmt.Sprintf(" --cwd=/data/%s", svc.name)
 	}
 	svc.Command += " " + basename
-	if opts.Jaeger {
-		svc.Command += ` --trace "jaeger=http://jaeger:14268;"`
+	if opts.Jaeger > 0 {
+		traceFlag := "jaeger=http://jaeger:4318;"
+		if opts.TraceRatio != "" {
+			traceFlag += fmt.Sprintf(" ratio=%s;", opts.TraceRatio)
+		}
+		if opts.TraceService {
+			traceFlag += fmt.Sprintf(" service=%s;", svc.name)
+		}
+		svc.Command += fmt.Sprintf(` --trace "%s"`, traceFlag)
 	}
 	return svc
 }
@@ -375,23 +395,44 @@ func getVolume(vol string) volume {
 
 }
 
-func getJaeger() service {
-	svc := service{
-		Image:         "jaegertracing/all-in-one:1.18",
+func getJaeger(version int) service {
+	if version == 2 {
+		// Jaeger v2.x uses OpenTelemetry Collector architecture with YAML config.
+		// OTLP receivers bind to localhost by default, so we need JAEGER_LISTEN_HOST=0.0.0.0
+		// for container environments.
+		return service{
+			Image:         "jaegertracing/jaeger:latest",
+			ContainerName: containerName("jaeger"),
+			Ports: []string{
+				toPort(4318),
+				toPort(16686),
+			},
+			Environment: []string{
+				"JAEGER_LISTEN_HOST=0.0.0.0",
+			},
+		}
+	}
+	// Jaeger v1.60 with badger storage
+	return service{
+		Image:         "jaegertracing/all-in-one:1.60",
 		ContainerName: containerName("jaeger"),
-		WorkingDir:    "/working/jaeger",
+		User:          "0",
 		Ports: []string{
-			toPort(14268),
+			toPort(4318),
 			toPort(16686),
 		},
+		Volumes: []volume{{
+			Type:   "volume",
+			Source: "jaeger-volume",
+			Target: "/jaeger",
+		}},
 		Environment: []string{
 			"SPAN_STORAGE_TYPE=badger",
 		},
 		Command: "--badger.ephemeral=false" +
-			" --badger.directory-key /working/jaeger" +
-			" --badger.directory-value /working/jaeger",
+			" --badger.directory-key /jaeger" +
+			" --badger.directory-value /jaeger",
 	}
-	return svc
 }
 
 func getMinio(minioDataDir string) service {
@@ -421,12 +462,12 @@ func getRatel() service {
 		portFlag = fmt.Sprintf(" -port=%d", opts.RatelPort)
 	}
 	svc := service{
-		Image:         opts.Image + ":" + opts.Tag,
+		Image:         "dgraph/ratel:latest",
 		ContainerName: containerName("ratel"),
 		Ports: []string{
 			toPort(opts.RatelPort),
 		},
-		Command: "dgraph-ratel" + portFlag,
+		Command: portFlag,
 	}
 	return svc
 }
@@ -543,8 +584,13 @@ func main() {
 		"run as the current user rather than root")
 	cmd.PersistentFlags().BoolVar(&opts.TmpFS, "tmpfs", false,
 		"store w and zw directories on a tmpfs filesystem")
-	cmd.PersistentFlags().BoolVarP(&opts.Jaeger, "jaeger", "j", false,
-		"include jaeger service")
+	cmd.PersistentFlags().IntVarP(&opts.Jaeger, "jaeger", "j", 0,
+		"include jaeger service (1 for v1.60, 2 for v2.x)")
+	cmd.PersistentFlags().Lookup("jaeger").NoOptDefVal = "1"
+	cmd.PersistentFlags().StringVar(&opts.TraceRatio, "trace_ratio", "",
+		"ratio of queries to trace (e.g., 0.01 for 1%)")
+	cmd.PersistentFlags().BoolVar(&opts.TraceService, "trace_service", false,
+		"use compose service name as trace service name (e.g., alpha1, zero1)")
 	cmd.PersistentFlags().BoolVarP(&opts.Metrics, "metrics", "m", false,
 		"include metrics (prometheus, grafana) services")
 	cmd.PersistentFlags().IntVarP(&opts.PortOffset, "port_offset", "o", 100,
@@ -555,7 +601,7 @@ func main() {
 		"./docker-compose.yml", "name of output file")
 	cmd.PersistentFlags().BoolVarP(&opts.LocalBin, "local", "l", true,
 		"use locally-compiled binary if true, otherwise use binary from docker container")
-	cmd.PersistentFlags().StringVar(&opts.Image, "image", "dgraph/dgraph",
+	cmd.PersistentFlags().StringVar(&opts.Image, "image", buildvars.DockerImage.Get(),
 		"Docker image for alphas and zeros.")
 	cmd.PersistentFlags().StringVarP(&opts.Tag, "tag", "t", "latest",
 		"Docker tag for the --image image. Requires -l=false to use binary from docker container.")
@@ -689,8 +735,11 @@ func main() {
 		cfg.Volumes["data"] = stringMap{}
 	}
 
-	if opts.Jaeger {
-		services["jaeger"] = getJaeger()
+	if opts.Jaeger > 0 {
+		services["jaeger"] = getJaeger(opts.Jaeger)
+		if opts.Jaeger == 1 {
+			cfg.Volumes["jaeger-volume"] = stringMap{}
+		}
 	}
 
 	if opts.Ratel {

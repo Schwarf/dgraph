@@ -28,7 +28,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"go.opencensus.io/plugin/ocgrpc"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/zpages"
 	"golang.org/x/net/trace"
 	"google.golang.org/grpc"
@@ -270,7 +270,13 @@ they form a Raft group and provide synchronous replication.
 			" 'v20': returns values with repeated key for fields with same alias (same as v20.11)."+
 			" For more details, see https://github.com/dgraph-io/dgraph/pull/7639").
 		Flag("enable-detailed-metrics", "Enable metrics about disk reads and cache per predicate").
+		Flag("log-slow-query-threshold", "Queries that take longer than this threshold will be logged "+
+			"with structured fields including trace ID for correlation with distributed traces. "+
+			"Disabled by default (0). Note: enabling this logs query text which may contain "+
+			"sensitive data; do not enable in deployments with strict data privacy requirements.").
 		String())
+
+	RegisterFlags(flag)
 }
 
 func setupCustomTokenizers() {
@@ -452,12 +458,22 @@ func serveGRPC(l net.Listener, tlsCfg *tls.Config, closer *z.Closer) {
 
 	x.RegisterExporters(Alpha.Conf, "dgraph.alpha")
 
+	unary := []grpc.UnaryServerInterceptor{audit.AuditRequestGRPC}
+	if zi := ZanzibarUnaryInterceptor(); zi != nil {
+		unary = append(unary, zi)
+	}
+	stream := []grpc.StreamServerInterceptor{audit.AuditStreamGRPC}
+	if zs := ZanzibarStreamInterceptor(); zs != nil {
+		stream = append(stream, zs)
+	}
+
 	opt := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(x.GrpcMaxSize),
 		grpc.MaxSendMsgSize(x.GrpcMaxSize),
 		grpc.MaxConcurrentStreams(1000),
-		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
-		grpc.UnaryInterceptor(audit.AuditRequestGRPC),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
 	}
 	if tlsCfg != nil {
 		tlsCfg.NextProtos = []string{"h2"}
@@ -468,6 +484,7 @@ func serveGRPC(l net.Listener, tlsCfg *tls.Config, closer *z.Closer) {
 	api.RegisterDgraphServer(s, &edgraph.Server{})
 	hapi.RegisterHealthServer(s, health.NewServer())
 	worker.RegisterZeroProxyServer(s)
+	RegisterZanzibar(s)
 
 	err := s.Serve(l)
 	glog.Errorf("GRPC listener canceled: %v\n", err)
@@ -616,7 +633,8 @@ func setupServer(closer *z.Closer, enableMcp bool) {
 		}
 	}
 
-	go x.StartListenHttpAndHttps(httpListener, tlsCfg, x.ServerCloser)
+	serverHandler := x.SanitizedDefaultServeMux()
+	go x.StartListenHttpAndHttps(httpListener, tlsCfg, x.ServerCloser, serverHandler)
 
 	go func() {
 		defer x.ServerCloser.Done()
@@ -790,6 +808,7 @@ func run() {
 		worker.FeatureFlagsDefaults)
 	x.Config.NormalizeCompatibilityMode = featureFlagsConf.GetString("normalize-compatibility-mode")
 	enableDetailedMetrics := featureFlagsConf.GetBool("enable-detailed-metrics")
+	x.WorkerConfig.SlowQueryLogThreshold = featureFlagsConf.GetDuration("log-slow-query-threshold")
 
 	x.PrintVersion()
 	glog.Infof("x.Config: %+v", x.Config)
@@ -812,6 +831,7 @@ func run() {
 	posting.Init(worker.State.Pstore, postingListCacheSize, removeOnUpdate)
 	posting.SetEnabledDetailedMetrics(enableDetailedMetrics)
 	defer posting.Cleanup()
+
 	worker.Init(worker.State.Pstore)
 
 	// setup shutdown os signal handler

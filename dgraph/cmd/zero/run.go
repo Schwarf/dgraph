@@ -142,7 +142,7 @@ func (st *state) serveGRPC(l net.Listener, store *raftwal.DiskStorage) {
 		grpc.MaxRecvMsgSize(x.GrpcMaxSize),
 		grpc.MaxSendMsgSize(x.GrpcMaxSize),
 		grpc.MaxConcurrentStreams(1000),
-		grpc.StatsHandler(otelgrpc.NewClientHandler()),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.UnaryInterceptor(audit.AuditRequestGRPC),
 	}
 
@@ -287,7 +287,7 @@ func run() {
 
 	tlsCfg, err := x.LoadServerTLSConfig(Zero.Conf)
 	x.Check(err)
-	go x.StartListenHttpAndHttps(httpListener, tlsCfg, st.zero.closer)
+	go x.StartListenHttpAndHttps(httpListener, tlsCfg, st.zero.closer, nil)
 
 	baseMux := http.NewServeMux()
 	http.Handle("/", audit.AuditRequestHttp(baseMux))

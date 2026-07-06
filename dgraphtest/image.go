@@ -12,11 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
 	"golang.org/x/mod/modfile"
+
+	"github.com/dgraph-io/dgraph/v25/buildvars"
 )
 
 var (
@@ -25,12 +28,21 @@ var (
 )
 
 func (c *LocalCluster) dgraphImage() string {
-	return "dgraph/dgraph:local"
+	return buildvars.DockerImage.Get() + ":local"
 }
 
-// setupBinary sets up the dgraph binary. The binary is expected to be a version
-// compiled that is compatible with the host OS and architecture. Search this repo
-// for DGRAPH_BINARY to learn its use.
+// setupBinary sets up dgraph binaries in tempBinDir.
+//
+// On Linux a single "dgraph" binary from $GOPATH/bin serves both Docker
+// containers and local commands (bulk/live loader).
+//
+// On non-Linux (macOS) two binaries are placed in tempBinDir:
+//   - "dgraph"      – a Linux binary for Docker containers, from
+//     $GOPATH/linux_<arch> (or LINUX_GOBIN if set).
+//   - "dgraph_host" – the host-native binary for local commands,
+//     from $GOPATH/bin.
+//
+// Both are produced by "make install".
 func (c *LocalCluster) setupBinary() error {
 	if err := ensureDgraphClone(); err != nil {
 		panic(err)
@@ -43,11 +55,39 @@ func (c *LocalCluster) setupBinary() error {
 		}
 	}
 	if c.conf.version == localVersion {
-		if os.Getenv("GOPATH") == "" {
+		gopath := os.Getenv("GOPATH")
+		if gopath == "" {
 			return errors.New("GOPATH is not set")
 		}
-		fromDir := filepath.Join(os.Getenv("GOPATH"), "bin")
-		return copyBinary(fromDir, c.tempBinDir, c.conf.version)
+
+		if handled, err := SetupLinuxBinaries(c.tempBinDir, c.conf.version); handled {
+			return err
+		}
+
+		if runtime.GOOS == "linux" {
+			// On Linux $GOPATH/bin/dgraph is both the native and Docker binary.
+			return copyBinary(filepath.Join(gopath, "bin"), c.tempBinDir, c.conf.version)
+		}
+
+		// Non-Linux (macOS): need separate Linux and host-native binaries.
+		// 1. Copy the Linux binary (for Docker containers) as "dgraph".
+		linuxDir := os.Getenv("LINUX_GOBIN")
+		if linuxDir == "" {
+			linuxDir = filepath.Join(gopath, "linux_"+runtime.GOARCH)
+		}
+		if err := copyBinary(linuxDir, c.tempBinDir, c.conf.version); err != nil {
+			return err
+		}
+
+		// 2. Copy the host-native binary (for local bulk/live commands) as
+		// hostBinaryFileName (see load.go).
+		hostSrc := filepath.Join(gopath, "bin", buildvars.BinaryName.Get())
+
+		hostDst := filepath.Join(c.tempBinDir, hostBinaryFileName)
+		if err := copyFile(hostSrc, hostDst); err != nil {
+			return errors.Wrapf(err, "error copying host-native binary from [%v] to [%v]", hostSrc, hostDst)
+		}
+		return nil
 	}
 
 	binaryPath := filepath.Join(binariesPath, fmt.Sprintf(binaryNameFmt, c.conf.version))
@@ -181,7 +221,7 @@ func buildDgraphBinary(dir, binaryDir, version string) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return errors.Wrapf(err, "error while building dgraph binary\noutput:%v", string(out))
 	}
-	if err := copy(filepath.Join(dir, "dgraph", "dgraph"),
+	if err := copyFile(filepath.Join(dir, "dgraph", "dgraph"),
 		filepath.Join(binaryDir, fmt.Sprintf(binaryNameFmt, version))); err != nil {
 		return errors.Wrap(err, "error while copying binary")
 	}
@@ -189,19 +229,19 @@ func buildDgraphBinary(dir, binaryDir, version string) error {
 }
 
 func copyBinary(fromDir, toDir, version string) error {
-	binaryName := "dgraph"
+	binaryName := buildvars.BinaryName.Get()
 	if version != localVersion {
 		binaryName = fmt.Sprintf(binaryNameFmt, version)
 	}
 	fromPath := filepath.Join(fromDir, binaryName)
-	toPath := filepath.Join(toDir, "dgraph")
-	if err := copy(fromPath, toPath); err != nil {
+	toPath := filepath.Join(toDir, buildvars.BinaryName.Get())
+	if err := copyFile(fromPath, toPath); err != nil {
 		return errors.Wrapf(err, "error while copying binary into tempBinDir [%v], from [%v]", toPath, fromPath)
 	}
 	return nil
 }
 
-func copy(src, dst string) error {
+func copyFile(src, dst string) error {
 	// Validate inputs
 	if src == "" || dst == "" {
 		return errors.New("source or destination paths cannot be empty")

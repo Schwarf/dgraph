@@ -57,12 +57,16 @@ type HttpToken struct {
 // HTTPClient allows doing operations on Dgraph over http
 type HTTPClient struct {
 	*HttpToken
+	// AuthToken is the --security auth-token (poor man's auth). When set, it is sent as the
+	// X-Dgraph-AuthToken header so admin requests are accepted on a token-protected cluster.
+	AuthToken     string
 	adminURL      string
 	graphqlURL    string
 	stateURL      string
 	dqlURL        string
 	dqlMutateUrl  string
 	alphaStateUrl string
+	moveTabletURL string
 }
 
 // GraphQLParams are used for making graphql requests to dgraph
@@ -258,6 +262,9 @@ func (hc *HTTPClient) doPost(body []byte, url string, contentType string) ([]byt
 
 	if hc.HttpToken != nil {
 		req.Header.Add("X-Dgraph-AccessToken", hc.AccessJwt)
+	}
+	if hc.AuthToken != "" {
+		req.Header.Add("X-Dgraph-AuthToken", hc.AuthToken)
 	}
 
 	return DoReq(req)
@@ -696,6 +703,30 @@ func (hc *HTTPClient) Mutate(mutation string, commitNow bool) ([]byte, error) {
 	return DoReq(req)
 }
 
+func (hc *HTTPClient) MoveTablet(predicate string, group uint32) error {
+	url := fmt.Sprintf("%s?tablet=%s&group=%d", hc.moveTabletURL, predicate, group)
+	response, err := http.Get(url)
+	if err != nil {
+		return errors.Wrapf(err, "error moving tablet via HTTP: predicate=%s, group=%d", predicate, group)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			log.Printf("[WARNING] error closing body: %v", err)
+		}
+	}()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return errors.Wrapf(err, "error reading move tablet response body")
+	}
+
+	if response.StatusCode != http.StatusOK {
+		return errors.Errorf("move tablet failed with status %d: %s", response.StatusCode, string(body))
+	}
+
+	return nil
+}
+
 // SetupSchema sets up DQL schema
 func (gc *GrpcClient) SetupSchema(dbSchema string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
@@ -784,9 +815,11 @@ func GetHttpClient(alphaUrl, zeroUrl string) (*HTTPClient, error) {
 
 	dqlUrl := "http://" + alphaUrl + "/query"
 	dqlMutateUrl := "http://" + alphaUrl + "/mutate"
+	moveTabletUrl := "http://" + zeroUrl + "/moveTablet"
 	return &HTTPClient{
 		adminURL:      adminUrl,
 		graphqlURL:    graphQLUrl,
+		moveTabletURL: moveTabletUrl,
 		stateURL:      stateUrl,
 		dqlURL:        dqlUrl,
 		dqlMutateUrl:  dqlMutateUrl,

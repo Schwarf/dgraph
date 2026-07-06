@@ -105,8 +105,11 @@ func TestBackupMinioE(t *testing.T) {
 	require.True(t, moveOk)
 
 	// Setup environmental variables for use during restore.
+	// Secret key padded to 14+ bytes so "AWS4"+secret satisfies the
+	// OpenSSL FIPS provider's HMAC key-length minimum (matches
+	// dgraph/minio.env, systest/backup.env).
 	t.Setenv("MINIO_ACCESS_KEY", "accesskey")
-	t.Setenv("MINIO_SECRET_KEY", "secretkey")
+	t.Setenv("MINIO_SECRET_KEY", "secretkey-long-enough")
 
 	// Setup test directories.
 	dirSetup(t)
@@ -375,7 +378,10 @@ func copyToLocalFs(t *testing.T) {
 		minio.ListObjectsOptions{Prefix: "", Recursive: false})
 	for object := range objectCh1 {
 		require.NoError(t, object.Err)
-		if object.Key != "manifest.json" {
+		// Only create local dirs for Minio directory prefixes (keys ending with "/").
+		// Root-level files like manifest.json and manifest_summary.json must not be
+		// treated as directories.
+		if strings.HasSuffix(object.Key, "/") {
 			dstDir := backupDir + "/" + object.Key
 			require.NoError(t, os.MkdirAll(dstDir, os.ModePerm))
 		}
